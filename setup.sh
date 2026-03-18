@@ -50,7 +50,7 @@ cat > CLAUDE.md << 'HEREDOC'
 # BitNet Autoresearch — Claude Code Instructions
 
 You are an autonomous ML research agent running Karpathy's Autoresearch methodology
-to fine-tune `microsoft/bitnet-b1.58-2B-4T` into a domain expert.
+to fine-tune `microsoft/bitnet-b1.58-2B-4T-bf16` into a domain expert.
 
 **Domain:** DOMAIN_PLACEHOLDER
 **Behaviour target:** BEHAVIOUR_PLACEHOLDER
@@ -111,7 +111,7 @@ Or read `last_result.json` which `finetune.py` writes before printing that line.
 
 These must NEVER be removed or changed:
 1. `replace_linear_with_bitnet_linear(model)` — the 1.58-bit conversion call
-2. `MODEL_ID = "microsoft/bitnet-b1.58-2B-4T"` — the base model
+2. `MODEL_ID = "microsoft/bitnet-b1.58-2B-4T-bf16"` — the base model (bf16 variant, required for training)
 3. The `print(f"VAL_LOSS={val_loss:.6f}")` final line
 4. Data loading from `data/train.jsonl` and `data/val.jsonl`
 
@@ -132,7 +132,7 @@ cat > program.md << 'HEREDOC'
 
 **Domain:** DOMAIN_PLACEHOLDER
 **Behaviour target:** BEHAVIOUR_PLACEHOLDER
-**Base model:** microsoft/bitnet-b1.58-2B-4T
+**Base model:** microsoft/bitnet-b1.58-2B-4T-bf16
 **Metric:** val_loss (lower is better)
 **Time budget per experiment:** BUDGET_PLACEHOLDER minutes
 **Dataset:** DATASET_PLACEHOLDER
@@ -270,7 +270,7 @@ Work through these ideas systematically. After exhausting obvious options, get c
 ## Hard constraints (never violate these)
 
 - `replace_linear_with_bitnet_linear(model)` must remain in `load_model()`
-- `MODEL_ID = "microsoft/bitnet-b1.58-2B-4T"` must not change
+- `MODEL_ID = "microsoft/bitnet-b1.58-2B-4T-bf16"` must not change
 - `print(f"VAL_LOSS={val_loss:.6f}")` must remain the final line of `finetune.py`
 - Data is always loaded from `data/train.jsonl` and `data/val.jsonl`
 - Do not edit `prepare.py` or `program.md`
@@ -523,20 +523,21 @@ from peft import LoraConfig, TaskType, get_peft_model  # type: ignore
 from transformers import (  # type: ignore
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
-    Trainer,
     TrainerCallback,
     TrainerControl,
     TrainerState,
     TrainingArguments,
 )
+from trl import SFTConfig, SFTTrainer  # type: ignore
 from datasets import load_dataset  # type: ignore
 from onebitllms import replace_linear_with_bitnet_linear  # type: ignore
 
 # ── HYPERPARAMETERS ───────────────────────────────────────────────────────────
 # Agent: edit values in this section. Do not change the structure below it.
 
-MODEL_ID        = "microsoft/bitnet-b1.58-2B-4T"
+# Use the bf16 variant — ternary-weight model with bfloat16 masters for training.
+# The int8 variant (bitnet-b1.58-2B-4T) cannot be gradient-updated directly.
+MODEL_ID        = "microsoft/bitnet-b1.58-2B-4T-bf16"
 DOMAIN          = "DOMAIN_PLACEHOLDER"
 BUDGET_MINUTES  = BUDGET_PLACEHOLDER         # hard time limit per experiment
 
@@ -548,13 +549,13 @@ LORA_TARGET_MODULES  = ["q_proj", "v_proj"]
 
 # Training
 LEARNING_RATE   = 2e-4
-BATCH_SIZE      = 4
-GRAD_ACCUM      = 4                  # effective batch = BATCH_SIZE * GRAD_ACCUM
-WARMUP_STEPS    = 50
+BATCH_SIZE      = 1
+GRAD_ACCUM      = 8                  # effective batch = BATCH_SIZE * GRAD_ACCUM
+WARMUP_RATIO    = 0.05
 MAX_SEQ_LEN     = 512
 WEIGHT_DECAY    = 0.01
 LR_SCHEDULER    = "cosine"           # cosine | linear | constant_with_warmup
-NUM_EPOCHS      = 3                  # will be cut short by BUDGET_MINUTES
+NUM_EPOCHS      = 999                # effectively infinite — time budget stops it
 
 # ── END HYPERPARAMETERS ───────────────────────────────────────────────────────
 
@@ -572,34 +573,50 @@ class TimeBudgetCallback(TrainerCallback):
         control: TrainerControl,
         **kwargs,
     ) -> TrainerControl:
+        # Note: fires at step boundaries; actual overshoot ≤ one step duration.
         if time.time() >= self.deadline:
             print(f"\nTime budget ({BUDGET_MINUTES} min) reached at step {state.global_step}. Stopping.")
             control.should_training_stop = True
         return control
 
 
-def load_data(tokenizer):
-    def _tokenize(example):
-        text = (
+def format_example(example: dict) -> dict:
+    """Convert {instruction, response} record to a single text field for SFTTrainer."""
+    return {
+        "text": (
             f"### Instruction:\n{example['instruction']}\n\n"
             f"### Response:\n{example['response']}"
         )
-        return tokenizer(
-            text,
-            truncation=True,
-            max_length=MAX_SEQ_LEN,
-            padding="max_length",
-        )
+    }
 
+
+def load_data():
     train_ds = load_dataset("json", data_files="data/train.jsonl", split="train")
     val_ds   = load_dataset("json", data_files="data/val.jsonl",   split="train")
-
-    train_ds = train_ds.map(_tokenize, remove_columns=train_ds.column_names)
-    val_ds   = val_ds.map(_tokenize,   remove_columns=val_ds.column_names)
-
-    train_ds.set_format("torch")
-    val_ds.set_format("torch")
+    train_ds = train_ds.map(format_example)
+    val_ds   = val_ds.map(format_example)
     return train_ds, val_ds
+
+
+def compute_val_loss(model, tokenizer, val_ds) -> float:
+    """Evaluate mean cross-entropy loss on the validation set (up to 200 examples)."""
+    model.eval()
+    device = next(model.parameters()).device
+    total_loss = 0.0
+    n = 0
+    with torch.no_grad():
+        for example in val_ds.select(range(min(200, len(val_ds)))):
+            inputs = tokenizer(
+                example["text"],
+                return_tensors="pt",
+                truncation=True,
+                max_length=MAX_SEQ_LEN,
+                padding=False,
+            ).to(device)
+            outputs = model(**inputs, labels=inputs["input_ids"])
+            total_loss += outputs.loss.item()
+            n += 1
+    return total_loss / max(n, 1)
 
 
 def load_model():
@@ -611,12 +628,13 @@ def load_model():
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        torch_dtype=torch.bfloat16,
         device_map=device_map,
         trust_remote_code=True,
     )
 
     # REQUIRED: convert linear layers to BitNet 1.58-bit ternary weights.
+    # Keeps bfloat16 master weights for gradient updates; quantises during forward.
     # This call must remain. Do not remove or comment out.
     model = replace_linear_with_bitnet_linear(model)
 
@@ -644,41 +662,38 @@ def main() -> None:
     print(f"{'='*60}\n")
 
     model, tokenizer = load_model()
-    train_ds, val_ds = load_data(tokenizer)
+    train_ds, val_ds = load_data()
 
-    training_args = TrainingArguments(
+    sft_config = SFTConfig(
         output_dir="./checkpoints",
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
         learning_rate=LEARNING_RATE,
-        warmup_steps=WARMUP_STEPS,
+        warmup_ratio=WARMUP_RATIO,
         num_train_epochs=NUM_EPOCHS,
         lr_scheduler_type=LR_SCHEDULER,
         weight_decay=WEIGHT_DECAY,
-        fp16=torch.cuda.is_available(),
+        bf16=torch.cuda.is_available(),
+        fp16=False,
+        max_seq_length=MAX_SEQ_LEN,
+        dataset_text_field="text",
         logging_steps=10,
-        eval_strategy="epoch",
+        eval_strategy="no",
         save_strategy="no",       # agent manages commits, not Trainer
         report_to="none",         # no wandb/tensorboard
         dataloader_num_workers=0,
-        remove_unused_columns=False,
     )
 
-    collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
-        args=training_args,
+        args=sft_config,
         train_dataset=train_ds,
-        eval_dataset=val_ds,
-        data_collator=collator,
         callbacks=[TimeBudgetCallback(BUDGET_MINUTES)],
     )
 
     trainer.train()
 
-    metrics = trainer.evaluate()
-    val_loss = metrics["eval_loss"]
+    val_loss = compute_val_loss(model, tokenizer, val_ds)
 
     # Write last_result.json (read by the agent after each experiment)
     result = {
@@ -692,11 +707,10 @@ def main() -> None:
             "learning_rate": LEARNING_RATE,
             "batch_size": BATCH_SIZE,
             "grad_accum": GRAD_ACCUM,
-            "warmup_steps": WARMUP_STEPS,
+            "warmup_ratio": WARMUP_RATIO,
             "max_seq_len": MAX_SEQ_LEN,
             "weight_decay": WEIGHT_DECAY,
             "lr_scheduler": LR_SCHEDULER,
-            "num_epochs": NUM_EPOCHS,
         },
         "steps_completed": trainer.state.global_step,
     }
